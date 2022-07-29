@@ -1104,52 +1104,66 @@ void ssl_store_delete_cafile_entry(struct cafile_entry *ca_e)
 }
 
 /*
- * Build a cafile_entry out of a buffer instead of out of a file.
+ * Build a X509_STORE out of a buffer.
+ * If src == NULL it will allocate a new X509_STORE
+ * If src != NULL it will add the certificate to the src
+ *
+ * The X509_STORE is returned in case of success.
+ * /!\ In case of error NULL is return, but the src could have been modified. /!\
+ *
  * This function is used when the "commit ssl ca-file" cli command is used.
  * It can parse CERTIFICATE sections as well as CRL ones.
- * Returns 0 in case of success, 1 otherwise.
  */
-int ssl_store_load_ca_from_buf(struct cafile_entry *ca_e, char *cert_buf)
+X509_STORE *ssl_store_load_ca_from_buf(X509_STORE *src, char *cert_buf)
 {
+	X509_STORE *dst;
+	STACK_OF(X509_INFO) *infos;
+	BIO *bio = NULL;
 	int retval = 0;
+	int i;
 
-	if (!ca_e)
-		return 1;
+	dst = src;
+	if (!dst)
+		dst = X509_STORE_new();
+	if (!dst)
+		goto err;
 
-	if (!ca_e->ca_store) {
-		ca_e->ca_store = X509_STORE_new();
-		if (ca_e->ca_store) {
-			BIO *bio = BIO_new_mem_buf(cert_buf, strlen(cert_buf));
-			if (bio) {
-				X509_INFO *info;
-				int i;
-				STACK_OF(X509_INFO) *infos = PEM_X509_INFO_read_bio(bio, NULL, NULL, NULL);
-				if (!infos)
-				{
-					BIO_free(bio);
-					return 1;
-				}
+	bio = BIO_new_mem_buf(cert_buf, strlen(cert_buf));
+	if (!bio)
+		goto err;
 
-				for (i = 0; i < sk_X509_INFO_num(infos) && !retval; i++) {
-					info = sk_X509_INFO_value(infos, i);
-					/* X509_STORE_add_cert and X509_STORE_add_crl return 1 on success */
-					if (info->x509) {
-						retval = !X509_STORE_add_cert(ca_e->ca_store, info->x509);
-					}
-					if (!retval && info->crl) {
-						retval = !X509_STORE_add_crl(ca_e->ca_store, info->crl);
-					}
-				}
-				retval = retval || (i != sk_X509_INFO_num(infos));
+	infos = PEM_X509_INFO_read_bio(bio, NULL, NULL, NULL);
+	if (!infos)
+		goto err;
 
-				/* Cleanup */
-				sk_X509_INFO_pop_free(infos, X509_INFO_free);
-				BIO_free(bio);
-			}
+	for (i = 0; i < sk_X509_INFO_num(infos) && !retval; i++) {
+		X509_INFO *info = sk_X509_INFO_value(infos, i);
+
+		/* X509_STORE_add_cert and X509_STORE_add_crl return 1 on success */
+		if (info->x509) {
+			retval = !X509_STORE_add_cert(dst, info->x509);
+		}
+		if (!retval && info->crl) {
+			retval = !X509_STORE_add_crl(dst, info->crl);
 		}
 	}
+	retval = retval || (i != sk_X509_INFO_num(infos));
+	if (retval)
+		goto err;
 
-	return retval;
+	/* Cleanup */
+	sk_X509_INFO_pop_free(infos, X509_INFO_free);
+	BIO_free(bio);
+
+	return dst;
+
+err:
+	BIO_free(bio);
+
+	if (src != dst)
+		X509_STORE_free(dst);
+
+	return NULL;
 }
 
 /*
@@ -2625,7 +2639,8 @@ static int cli_parse_set_cafile(char **args, char *payload, struct appctx *appct
 	}
 
 	/* Fill the new entry with the new CAs. */
-	if (ssl_store_load_ca_from_buf(new_cafile_entry, payload)) {
+	new_cafile_entry->ca_store = ssl_store_load_ca_from_buf(NULL, payload);
+	if (new_cafile_entry->ca_store == NULL) {
 		memprintf(&err, "%sInvalid payload\n", err ? err : "");
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;
@@ -3315,7 +3330,8 @@ static int cli_parse_set_crlfile(char **args, char *payload, struct appctx *appc
 	}
 
 	/* Fill the new entry with the new CRL. */
-	if (ssl_store_load_ca_from_buf(new_crlfile_entry, payload)) {
+	new_crlfile_entry->ca_store = ssl_store_load_ca_from_buf(NULL, payload);
+	if (new_crlfile_entry->ca_store == NULL) {
 		memprintf(&err, "%sInvalid payload\n", err ? err : "");
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;
